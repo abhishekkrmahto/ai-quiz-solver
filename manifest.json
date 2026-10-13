@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Quiz Auto Solver",
-  "version": "2.0",
-  "description": "Quiz ChatGPT se fata-fat solve karwata hai",
+  "version": "3.0",
+  "description": "Quiz Solver",
   "permissions": ["tabs", "debugger"],
   "host_permissions": ["<all_urls>"],
   "background": { "service_worker": "background.js" },
