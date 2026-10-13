@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "Quiz Auto Solver",
+  "version": "2.0",
+  "description": "Quiz ChatGPT se fata-fat solve karwata hai",
+  "permissions": ["tabs", "debugger"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js" },
+  "action": {},
+  "commands": {
+    "toggle-panel": {
+      "suggested_key": { "default": "Ctrl+Shift+Y" },
+      "description": "Quiz panel kholo/band karo"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"],
+      "js": ["content-gpt.js"]
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content-quiz.js"],
+      "all_frames": true
+    }
+  ]
+}
