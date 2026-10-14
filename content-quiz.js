@@ -1,711 +1,605 @@
-// ============================================================
-// content-quiz.js — BATCH: collect all -> apply answers -> submit
-// ============================================================
+"use strict";
 
 const LETTERS = ["A", "B", "C", "D", "E", "F"];
-const IS_GPT = location.hostname.includes("chatgpt") || location.hostname.includes("openai");
 const IS_TOP = window.top === window;
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-let cycling = false;
-let collecting = false;
-let answeredOnce = false;
-let collected = [];
-let lastAnswers = null;
-
-function sendMsg(payload, timeoutMs = 4000) {
-  try {
-    return Promise.race([
-      chrome.runtime.sendMessage(payload),
-      new Promise((res) => setTimeout(() => res(null), timeoutMs)),
-    ]).catch(() => null);
-  } catch { return Promise.resolve(null); }
+function normalizeText(value) {
+  return String(value || "")
+    .normalize("NFKC")
+    .toLocaleLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim()
+    .replace(/\s+/g, " ");
 }
 
-// ================= MESSAGE HANDLER =================
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.type === "SHOW_PANEL") { if (IS_TOP) togglePanel(); sendResponse({ ok: true }); return; }
-  if (msg.type === "STATUS") { addLog(msg.text); return; }
-  if (msg.type === "PING") { sendResponse({ ok: true }); return; }
-  if (msg.type === "VERIFY_FINISH") {
-    const q = getQuestion();
-    const cards = getOptionCards();
-    sendResponse({ done: !q && cards.length < 2 });
+function validLetter(letter, optionCount) {
+  const value = String(letter || "").toUpperCase();
+  const index = LETTERS.indexOf(value);
+  return value.length === 1 && index >= 0 && index < optionCount ? value : null;
+}
+
+let flowId = 0;
+let running = false;
+let questions = [];
+let automationClick = false;
+let currentRunId = null;
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type === "STATUS") {
+    if (IS_TOP) showStatus(message.text);
     return;
   }
-  if (IS_GPT) return;
-
-  if (msg.type === "START_FLOW") {
-    if (collecting || cycling) return;
-    collecting = true;
-    startFlow().finally(() => { collecting = false; });
+  if (message.type === "CANCEL") {
+    flowId++;
+    running = false;
+    questions = [];
+    currentRunId = null;
+    sendResponse({ ok: true });
+    return;
   }
-  if (msg.type === "APPLY_ANSWERS") {
-    if (cycling) return;
-    lastAnswers = msg.answers || {};
-    cycling = true;
-    applyAnswers().finally(() => { cycling = false; });
+  if (message.type === "APPLY_BATCH") {
+    if (running || message.runId !== currentRunId || !questions.length) {
+      sendResponse({
+        ok: false,
+        error: running
+          ? "Quiz frame abhi scan/apply kar raha hai."
+          : "Quiz scan session expire ho gaya; Start dobara dabayein."
+      });
+      return;
+    }
+    const currentFlow = flowId;
+    running = true;
+    applyKnownAnswers(currentFlow, message.answers, questions.length)
+      .then((applied) => {
+        sendResponse(applied
+          ? { ok: true }
+          : { ok: false, error: "Quiz answer apply/submit complete nahi hua." });
+      })
+      .catch(async (error) => {
+        const detail = error instanceof Error ? error.message : String(error);
+        await pauseFlow(currentFlow, "Answer apply failed: " + detail);
+        sendResponse({ ok: false, error: detail });
+      })
+      .finally(() => {
+        if (flowId === currentFlow) running = false;
+      });
+    return true;
   }
-  if (msg.type === "GET_QUESTION") { if (!cycling && !collecting) scanAndSend(); }
-  if (msg.type === "CLICK_ANSWER") answerCycle(msg.letter);
-  if (msg.type === "RECOVER") { if (!cycling && !collecting) recover(); }
+  if (message.type === "PROBE") {
+    if (running || !getQuestion() || getOptionCards().length < 2) return;
+    sendResponse({ ok: true });
+    currentRunId = message.runId;
+    claimAndRun(message.runId);
+    return;
+  }
 });
 
-// ================= BATCH: COLLECT =================
-function normQ(t) {
-  return String(t || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().slice(0, 100);
-}
-
-function parseBadge() {
-  const scope = getScope();
-  const t = (scope.innerText || "") + " " + (document.body.innerText || "").slice(0, 3000);
-  const m = t.match(/QUESTION\s+(\d+)\s+OF\s+(\d+)/i);
-  if (!m) return null;
-  return { cur: parseInt(m[1], 10), total: parseInt(m[2], 10) };
-}
-
-async function waitForQuestion(maxMs = 8000) {
-  const steps = Math.ceil(maxMs / 400);
-  for (let i = 0; i < steps; i++) {
-    const q = getQuestion();
-    if (q) return q;
-    await sleep(400);
+async function claimAndRun(runId) {
+  running = true;
+  const currentFlow = ++flowId;
+  try {
+    const claim = await chrome.runtime.sendMessage({ type: "CLAIM_FRAME", runId });
+    if (!claim || !claim.ok) return;
+    await runQuiz(currentFlow);
+  } catch (error) {
+    pauseFlow(currentFlow, "Quiz start nahi hua: " + error.message);
+  } finally {
+    if (flowId === currentFlow) running = false;
   }
-  return null;
 }
 
-async function waitNextEnabled(polls = 8) {
-  for (let i = 0; i < polls; i++) {
-    const b = findNextBtn();
-    if (b && !b.disabled && b.getAttribute("aria-disabled") !== "true") return b;
-    await sleep(300);
+async function runQuiz(currentFlow) {
+  const badge = parseBadge();
+  if (!badge || badge.total < 1 || badge.total > 60) {
+    pauseFlow(currentFlow, "Question count detect nahi hua (ya 60 se zyada hai); safe stop.");
+    return;
   }
-  return null;
-}
 
-async function advanceNext(prevQ) {
-  for (let round = 1; round <= 2; round++) {
-    let btn = await waitNextEnabled(8);
-    if (!btn) {
-      const cards = getOptionCards();
-      if (cards.length >= 2) {
-        addLog("NEXT disabled — temp select kar raha hun...");
-        await clickEl(cards[0]);
-        btn = await waitNextEnabled(8);
-      }
-      if (!btn) return false;
-    }
-    await clickEl(btn);
-    for (let j = 0; j < 12; j++) {
-      await sleep(300);
-      const nowQ = getQuestion();
-      if (!nowQ) return "closed";
-      if (nowQ !== prevQ) return true;
-    }
-    const b2 = findNextBtn();
-    if (b2) humanClick(b2);
-    await sleep(800);
+  setStatus("📦 " + badge.total + " questions scan ho rahe hain...");
+  const list = await collectAll(currentFlow, badge.total);
+  if (isStale(currentFlow)) return;
+  if (list.length !== badge.total) {
+    pauseFlow(currentFlow, "Sirf " + list.length + "/" + badge.total + " questions scan hue; submit nahi kiya.");
+    return;
   }
-  return false;
+
+  questions = list;
+  setStatus("📤 Sare " + list.length + " questions ek saath ChatGPT ko bhej raha hun...");
+  const result = await chrome.runtime.sendMessage({
+    type: "QUESTIONS_READY",
+    runId: currentRunId,
+    questions: list
+  });
+  if (!result || !result.ok) {
+    pauseFlow(currentFlow, (result && result.error) || "ChatGPT ko questions nahi bhej paya.");
+  }
 }
 
-async function collectAll() {
+async function collectAll(currentFlow, total) {
   const list = [];
-  while (list.length < 60) {
-    const q = await waitForQuestion(8000);
-    if (!q) break;
-    const lastKey = list.length ? normQ(list[list.length - 1].q) : null;
-    if (lastKey && normQ(q) === lastKey) break;
+  while (list.length < total) {
+    if (isStale(currentFlow)) return list;
+    const question = await waitForQuestion(currentFlow, 8000);
+    if (!question) return list;
 
     const cards = getOptionCards();
-    const isMCQ = cards.length >= 2;
-    list.push({
-      n: list.length + 1,
-      q: q,
-      options: isMCQ ? cards.map(cleanText) : [],
-      type: isMCQ ? "mcq" : "null",
-    });
-    addLog("📦 Q" + list.length + " mila" + (isMCQ ? "" : " — writing/recording => NULL"));
+    if (cards.length < 2) return list;
+    const options = cards.map((card) => optionText(card));
+    if (options.some((option) => !option)) return list;
+    list.push({ n: list.length + 1, q: question, options });
+    setStatus("📦 Scanned " + list.length + "/" + total);
 
     const badge = parseBadge();
-    if (badge && badge.cur >= badge.total) {
-      addLog("📦 Sare " + badge.total + " questions mil gaye!");
-      break;
-    }
-    if (!badge) break;
+    if (badge && badge.cur >= badge.total) break;
+    if (!badge || badge.total !== total) return list;
 
-    const moved = await advanceNext(q);
-    if (moved === "closed") { addLog("⚠ Dialog band ho gaya collection me!"); break; }
-    if (!moved) {
-      addLog(list[list.length - 1].type === "null"
-        ? "⚠ Writing/Recording question NEXT block kar raha hai — yahan tak collect hua"
-        : "⚠ Aage nahi badh saka — yahan tak collect hua");
-      break;
-    }
+    const advanced = await advanceNext(currentFlow, question, badge.cur);
+    if (advanced !== true) return list;
   }
   return list;
 }
 
-async function startFlow() {
-  const q = await waitForQuestion(10000);
-  if (!q) { addLog("⚠ Question nahi mila — dialog khula hai?"); return; }
-
-  const badge = parseBadge();
-  if (!badge) {
-    addLog("ℹ Badge nahi mila — one-by-one mode");
-    const cards = getOptionCards();
-    answeredOnce = true;
-    sendMsg({ type: "QUESTION", question: q, options: cards.map(cleanText) });
-    return;
-  }
-
-  addLog("🚀 Batch mode: " + badge.total + " questions collect kar raha hun...");
-  collected = await collectAll();
-  if (!collected.length) { addLog("⚠ Kuch collect nahi hua"); return; }
-  sendMsg({ type: "ALL_QUESTIONS", questions: collected });
-}
-
-// ================= BATCH: APPLY =================
-function findBackBtn() {
-  const scope = getScope();
-  const all = [...scope.querySelectorAll("button"), ...document.querySelectorAll("button")];
-  return all.find((b) => {
-    if (b.closest("#qa-root")) return false;
-    if (!isVisible(b)) return false;
-    if (b.disabled || b.getAttribute("aria-disabled") === "true") return false;
-    return /back|previous/i.test(b.innerText.trim());
-  }) || null;
-}
-
-async function goBackToFirst() {
-  const first = normQ(collected[0].q);
-  for (let i = 0; i < 15; i++) {
-    const q = getQuestion();
-    if (!q) return false;
-    if (normQ(q) === first) return true;
-    const badge = parseBadge();
-    if (badge && badge.cur <= 1) return true;
-    const back = findBackBtn();
-    if (!back) { addLog("⚠ BACK button nahi mila"); return false; }
-    await clickEl(back);
-    await sleep(600);
-  }
-  const q = getQuestion();
-  return !!(q && normQ(q) === first);
-}
-
-async function applyAnswers() {
-  if (!collected.length) return;
-  if (!lastAnswers) lastAnswers = {};
-
-  addLog("🖊 Q1 pe wapas ja raha hun...");
-  const okBack = await goBackToFirst();
-  if (!okBack) {
-    addLog("⚠ BACK fail — page dekho");
-    sendMsg({ type: "FINISHED" });
-    resetStartBtn();
-    return;
-  }
-
-  const mcqCount = collected.filter((e) => e.type === "mcq").length;
-  addLog("🖊 Ab " + mcqCount + " answers tick + submit...");
-
-  for (let i = 0; i < collected.length + 3; i++) {
-    const q = getQuestion();
-    if (!q) {
-      addLog("🎉 Submit ho gaya!");
-      sendMsg({ type: "FINISHED" });
-      resetStartBtn();
-      return;
-    }
-    const entry = collected.find((e) => normQ(e.q) === normQ(q));
-    if (!entry) { addLog("⚠ Anjaan question — ruk gaya"); break; }
-
-    const letter = lastAnswers[entry.n];
-    const cards = getOptionCards();
-
-    if (entry.type === "mcq" && letter && cards.length >= 2) {
-      const idx = LETTERS.indexOf(letter);
-      if (idx >= 0 && cards[idx]) {
-        if (!isSelected(cards[idx])) {
-          await clickEl(cards[idx]);
-          let ok = false;
-          for (let k = 0; k < 3; k++) {
-            await sleep(250);
-            const f = getOptionCards();
-            if (f[idx] && isSelected(f[idx])) { ok = true; break; }
-          }
-          if (!ok) addLog("⚠ " + letter + " select nahi hua (locked?)");
-        }
-        addLog("✓ Q" + entry.n + " = " + letter);
-      }
-    } else if (entry.type === "mcq") {
-      addLog("⚠ Q" + entry.n + " ka answer GPT ne nahi diya — skip");
-    } else {
-      addLog("⏭ Q" + entry.n + " NULL — skip");
-    }
-
-    const badge = parseBadge();
-    const isLast = badge && badge.cur >= badge.total;
-    const prevQ = q;
-
-    let btn = await waitNextEnabled(8);
-    if (!btn) {
-      const cs = getOptionCards();
-      if (cs.length >= 2) {
-        await clickEl(cs[0]);
-        btn = await waitNextEnabled(6);
-      }
-    }
-    if (!btn) { addLog("⚠ NEXT blocked — manually dekhna padega"); break; }
-
-    if (isLast) addLog("📤 Last question — submit!");
-    await clickEl(btn);
-
-    let closed = false, moved = false;
-    for (let j = 0; j < 12; j++) {
-      await sleep(350);
-      const nowQ = getQuestion();
-      if (!nowQ) { closed = true; break; }
-      if (nowQ !== prevQ) { moved = true; break; }
-    }
-    if (closed) {
-      addLog("🎉 Submit ho gaya!");
-      sendMsg({ type: "FINISHED" });
-      resetStartBtn();
-      return;
-    }
-    if (!moved) {
-      addLog("NEXT retry...");
-      const b2 = findNextBtn();
-      if (b2) { humanClick(b2); await sleep(900); }
-    }
-  }
-  addLog("⚠ Apply khatam — page check karo");
-  sendMsg({ type: "FINISHED" });
-  resetStartBtn();
-}
-
-// ================= SINGLE MODE (fallback) =================
-async function answerCycle(letter) {
-  if (cycling) return;
-  cycling = true;
-  try {
-    if (!getQuestion() && getOptionCards().length < 2) {
-      addLog("🎉 Quiz complete!");
-      sendMsg({ type: "FINISHED" });
-      resetStartBtn();
-      return;
-    }
-    const prevQ = getQuestion();
-    const cards = getOptionCards();
-    const idx = LETTERS.indexOf(letter);
-    if (idx >= 0 && cards[idx]) {
-      if (!isSelected(cards[idx])) {
-        addLog("Option " + letter + " click...");
-        await clickEl(cards[idx]);
-        let ok = false;
-        for (let i = 0; i < 3; i++) {
-          await sleep(250);
-          const fresh = getOptionCards();
-          if (fresh[idx] && isSelected(fresh[idx])) { ok = true; break; }
-        }
-        if (!ok) { humanClick(cards[idx]); await sleep(400); }
-        addLog("✓ " + letter + " done");
-      } else {
-        addLog(letter + " already selected ✓");
-      }
-    } else {
-      if (!getQuestion()) {
-        addLog("🎉 Quiz complete!");
-        sendMsg({ type: "FINISHED" });
-        resetStartBtn();
-        return;
-      }
-      addLog("⚠ Option " + letter + " nahi mila");
-    }
-    await clickNext(prevQ);
-    await scanAndSend();
-  } finally {
-    cycling = false;
-  }
-}
-
-async function clickNext(prevQ) {
-  for (let round = 1; round <= 3; round++) {
-    let btn = null;
-    for (let i = 0; i < 10; i++) {
-      const b = findNextBtn();
-      if (b && !b.disabled && b.getAttribute("aria-disabled") !== "true") { btn = b; break; }
-      await sleep(300);
-    }
-    if (!btn) {
-      if (!getQuestion()) {
-        addLog("🎉 Quiz complete!");
-        sendMsg({ type: "FINISHED" });
-        resetStartBtn();
-        return false;
-      }
-      addLog("⚠ NEXT nahi mila");
-      logBtnDiagnostics();
+async function advanceNext(currentFlow, previousQuestion, previousNumber) {
+  let next = await waitForNext(5);
+  if (!next) {
+    const firstCard = getOptionCards()[0];
+    if (!firstCard) {
+      setStatus("➡️ Q" + previousNumber + ": Next button nahi mila aur temporary option bhi detect nahi hua.");
       return false;
     }
-    addLog("NEXT click (" + round + ")...");
-    await clickEl(btn);
-    for (let j = 0; j < 5; j++) {
-      await sleep(400);
-      const nowQ = getQuestion();
-      if (!nowQ || nowQ !== prevQ) return true;
-    }
-    humanClick(btn);
-    await sleep(700);
-    const nowQ2 = getQuestion();
-    if (!nowQ2 || nowQ2 !== prevQ) return true;
+    await clickAutomation(firstCard);
+    next = await waitForNext(8);
   }
-  addLog("⚠ NEXT fail — page dekho");
-  logBtnDiagnostics();
-  return false;
+  if (!next) {
+    setStatus("➡️ Q" + previousNumber + ": option select kiya, lekin enabled Next/Submit control nahi mila.");
+    return false;
+  }
+  if (isStale(currentFlow)) return false;
+  await clickAutomation(next);
+  const advanced = await waitForQuestionChange(currentFlow, previousQuestion, previousNumber);
+  if (!advanced) {
+    setStatus("➡️ Q" + previousNumber + ": Next click ke baad agla question nahi khula.");
+  }
+  return advanced;
 }
 
-async function scanAndSend(depth = 0) {
-  for (let attempt = 0; attempt < 24; attempt++) {
-    const q = getQuestion();
+async function applyKnownAnswers(currentFlow, answers, total) {
+  const quizReady = await waitForReturnedQuiz(currentFlow, 120000);
+  if (!quizReady) {
+    return pauseFlow(currentFlow, "Quiz fullscreen ready nahi hua; Enter Full Screen manually click karke dobara Start karein.");
+  }
+  setStatus("⏪ ChatGPT answers mil gaye; quiz ke pehle question par ja raha hun...");
+  const first = await goBackToFirst(currentFlow);
+  if (!first) {
+    return pauseFlow(currentFlow, "Answers mil gaye, lekin quiz ke pehle question par wapas nahi ja saka; submit nahi kiya.");
+  }
+
+  for (let index = 0; index < questions.length; index++) {
+    if (isStale(currentFlow)) return;
+    const question = getQuestion();
+    const entry = questions[index];
+    if (!question || normalizeText(question) !== normalizeText(entry.q)) {
+      return pauseFlow(currentFlow, "Q" + entry.n + " par page match nahi hui; submit nahi kiya.");
+    }
+
+    const letter = validLetter(answers[entry.n], entry.options.length);
+    if (!letter) {
+      return pauseFlow(currentFlow, "Q" + entry.n + " ka answer nahi mila. Is aur baaki questions ko manually check karein; submit nahi kiya.");
+    }
+    const card = getOptionCards()[LETTERS.indexOf(letter)];
+    if (!card) {
+      return pauseFlow(currentFlow, "Q" + entry.n + " ka option nahi mila; submit nahi kiya.");
+    }
     const cards = getOptionCards();
-    if (q && cards.length >= 2) {
-      answeredOnce = true;
-      sendMsg({ type: "QUESTION", question: q, options: cards.map(cleanText) });
-      return;
+    const alreadySelected = isSelected(card, cards);
+    const beforeClick = selectionFingerprint(card);
+    if (!alreadySelected) await clickAutomation(card);
+    if (!await waitForSelection(card, cards, beforeClick, 1500)) {
+      return pauseFlow(currentFlow, "Q" + entry.n + " ka answer select verify nahi hua; submit nahi kiya.");
     }
-    await sleep(500);
-  }
-  const q = getQuestion();
-  const cards = getOptionCards();
-  if (!q && cards.length < 2) {
-    if (answeredOnce) { sendMsg({ type: "FINISHED" }); resetStartBtn(); }
-    else addLog("⚠ Question nahi mila — dialog khula hai?");
-    return;
-  }
-  if (depth < 2) {
-    addLog("⚠ Question detect slow — dobara scan...");
-    await sleep(1500);
-    await scanAndSend(depth + 1);
-  } else {
-    addLog("⚠ Question detect nahi ho raha — Stop dabao, screenshot bhejo");
-  }
-}
+    setStatus("✓ Q" + entry.n + "/" + total + " = " + letter);
 
-async function recover() {
-  // Batch resume
-  if (collected.length && lastAnswers) {
-    addLog("Recover: apply resume...");
-    cycling = true;
-    try { await applyAnswers(); } finally { cycling = false; }
-    return;
-  }
-  const q = getQuestion();
-  const cards = getOptionCards();
-  if (!q) {
-    if (answeredOnce && cards.length < 2) {
-      addLog("🎉 Quiz complete!");
-      sendMsg({ type: "FINISHED" });
-      resetStartBtn();
+    const previousNumber = parseBadge()?.cur;
+    const next = await waitForNext(8);
+    if (!next) {
+      return pauseFlow(currentFlow, "Q" + entry.n + " par Next/Submit disabled; manually check karein.");
     }
-    return;
-  }
-  const selIdx = cards.findIndex(isSelected);
-  cycling = true;
-  try {
-    if (selIdx >= 0) {
-      addLog("Recover: " + LETTERS[selIdx] + " selected — NEXT");
-      await clickNext(q);
-      await scanAndSend();
+    await clickAutomation(next);
+    if (index < questions.length - 1) {
+      const moved = await waitForQuestionChange(currentFlow, entry.q, previousNumber);
+      if (!moved) {
+        return pauseFlow(currentFlow, "Q" + entry.n + " se aage nahi badha; submit nahi kiya.");
+      }
     } else {
-      addLog("Recover: Q dobara bheja");
-      sendMsg({ type: "QUESTION", question: q, options: cards.map(cleanText) });
+      const finished = await waitForFinish(currentFlow, entry.q);
+      if (!finished) {
+        return pauseFlow(currentFlow, "Submit confirm nahi hua; page manually check karein.");
+      }
     }
-  } finally { cycling = false; }
-}
-
-// ================= CLICKING =================
-function isVisible(el) {
-  const r = el.getBoundingClientRect();
-  return r.width > 5 && r.height > 5;
-}
-
-function absRect(el) {
-  try {
-    let x = 0, y = 0, win = window, cur = el;
-    while (true) {
-      const r = cur.getBoundingClientRect();
-      if (r.width < 3 || r.height < 3) return null;
-      x += r.left + r.width / 2;
-      y += r.top + r.height / 2;
-      if (win === window.top) break;
-      cur = win.frameElement;
-      if (!cur) return null;
-      win = win.parent;
-    }
-    return { x: Math.round(x), y: Math.round(y) };
-  } catch { return null; }
-}
-
-async function clickEl(el) {
-  try { el.scrollIntoView({ block: "center" }); } catch {}
-  await sleep(150);
-  const pos = absRect(el);
-  if (pos) {
-    const res = await sendMsg({ type: "REAL_CLICK", x: pos.x, y: pos.y }, 4000);
-    if (res && res.ok) return true;
-    if (res && res.error) addLog("⚠ Real click: " + res.error);
   }
-  humanClick(el);
+
+  await chrome.runtime.sendMessage({ type: "FINISHED" });
+  return true;
+}
+
+async function waitForReturnedQuiz(currentFlow, maxMs) {
+  const end = Date.now() + maxMs;
+  let fullscreenStatusShown = false;
+  while (Date.now() < end) {
+    if (isStale(currentFlow)) return false;
+    if (isFullscreenGateVisible()) {
+      if (!fullscreenStatusShown) {
+        setStatus("🖥️ Quiz fullscreen maang raha hai — Enter Full Screen click karein; main wait kar raha hun...");
+        fullscreenStatusShown = true;
+      }
+      await sleep(500);
+      continue;
+    }
+    if (getQuestion() && getOptionCards().length >= 2) return true;
+    await sleep(300);
+  }
   return false;
 }
 
-function humanClick(el) {
-  const r = el.getBoundingClientRect();
-  const opts = {
-    bubbles: true, cancelable: true, view: window,
-    clientX: r.left + r.width / 2, clientY: r.top + r.height / 2,
-  };
-  el.dispatchEvent(new PointerEvent("pointerdown", opts));
-  el.dispatchEvent(new MouseEvent("mousedown", opts));
-  el.dispatchEvent(new PointerEvent("pointerup", opts));
-  el.dispatchEvent(new MouseEvent("mouseup", opts));
-  el.dispatchEvent(new MouseEvent("click", opts));
+function isFullscreenGateVisible() {
+  const text = (document.body && document.body.innerText || "").toLowerCase();
+  return text.includes("full screen required") ||
+    text.includes("enter full screen");
 }
 
-function isSelected(btn) {
+async function goBackToFirst(currentFlow) {
+  const first = normalizeText(questions[0] && questions[0].q);
+  const maxSteps = Math.min(60, Math.max(1, questions.length + 2));
+  for (let i = 0; i < maxSteps; i++) {
+    if (isStale(currentFlow)) return false;
+    const question = await waitForQuestion(currentFlow, 2500);
+    const badge = parseBadge();
+    if (question && normalizeText(question) === first &&
+        (!badge || badge.cur === 1)) return true;
+    if (!question || (badge && badge.cur <= 1)) return false;
+    const back = findPreviousButton();
+    if (!back) {
+      setStatus("⏪ Q" + (badge ? badge.cur : "?") +
+        " se Q1 par lautne ke liye Previous button nahi mila.");
+      return false;
+    }
+    const previousNumber = badge && badge.cur;
+    await clickAutomation(back);
+    if (!await waitForPreviousQuestion(currentFlow, question, previousNumber)) {
+      setStatus("⏪ Previous click ke baad quiz question nahi badla.");
+      return false;
+    }
+  }
+  return false;
+}
+
+async function waitForPreviousQuestion(currentFlow, previousQuestion, previousNumber) {
+  const previous = normalizeText(previousQuestion);
+  const end = Date.now() + 5000;
+  while (Date.now() < end) {
+    if (isStale(currentFlow)) return false;
+    const question = getQuestion();
+    const badge = parseBadge();
+    if (question && (
+      normalizeText(question) !== previous ||
+      (previousNumber && badge && badge.cur < previousNumber)
+    )) return true;
+    await sleep(200);
+  }
+  return false;
+}
+
+async function waitForQuestion(currentFlow, maxMs) {
+  const end = Date.now() + maxMs;
+  while (Date.now() < end) {
+    if (isStale(currentFlow)) return null;
+    const question = getQuestion();
+    if (question) return question;
+    await sleep(200);
+  }
+  return null;
+}
+
+async function waitForQuestionChange(currentFlow, previousQuestion, previousNumber) {
+  const previous = normalizeText(previousQuestion);
+  const end = Date.now() + 5000;
+  while (Date.now() < end) {
+    if (isStale(currentFlow)) return false;
+    const question = getQuestion();
+    if (!question) {
+      await sleep(200);
+      continue;
+    }
+    const badge = parseBadge();
+    if (normalizeText(question) !== previous ||
+        (previousNumber && badge && badge.cur > previousNumber)) return true;
+    await sleep(200);
+  }
+  return false;
+}
+
+async function waitForFinish(currentFlow, previousQuestion) {
+  const end = Date.now() + 8000;
+  let emptySince = null;
+  while (Date.now() < end) {
+    if (isStale(currentFlow)) return false;
+    const question = getQuestion();
+    if (!question) {
+      if (emptySince === null) emptySince = Date.now();
+      if (Date.now() - emptySince >= 1200) return true;
+    } else {
+      emptySince = null;
+    }
+    await sleep(250);
+  }
+  return false;
+}
+
+async function waitForNext(polls) {
+  for (let i = 0; i < polls; i++) {
+    const button = findNextButton();
+    if (button && !button.disabled && button.getAttribute("aria-disabled") !== "true") {
+      return button;
+    }
+    await sleep(250);
+  }
+  return null;
+}
+
+async function waitForSelection(card, cards, beforeClick, maxMs) {
+  const end = Date.now() + maxMs;
+  while (Date.now() < end) {
+    if (isSelected(card, cards) || selectionFingerprint(card) !== beforeClick) return true;
+    await sleep(150);
+  }
+  return false;
+}
+
+async function clickAutomation(element) {
+  automationClick = true;
   try {
-    const bg = getComputedStyle(btn).backgroundColor;
-    const m = bg.match(/\d+/g);
-    if (!m) return false;
-    const sum = m.slice(0, 3).reduce((a, c) => a + Number(c), 0);
-    return sum < 350;
-  } catch { return false; }
+    element.scrollIntoView({ block: "center", inline: "nearest" });
+    element.click();
+  } finally {
+    setTimeout(() => { automationClick = false; }, 0);
+  }
+  await sleep(200);
 }
 
-// ================= DETECTION =================
+function pauseFlow(currentFlow, text) {
+  if (isStale(currentFlow)) return Promise.resolve(false);
+  return chrome.runtime.sendMessage({ type: "PAUSED", text })
+    .then(() => false);
+}
+
+function isStale(currentFlow) {
+  return currentFlow !== flowId;
+}
+
+function parseBadge() {
+  const scope = getScope();
+  if (!scope) return null;
+  const text = (scope.innerText || "") + " " + (document.body.innerText || "").slice(0, 3000);
+  const match = text.match(/QUESTION\s+(\d+)\s+OF\s+(\d+)/i);
+  return match ? { cur: Number(match[1]), total: Number(match[2]) } : null;
+}
+
 function getScope() {
-  return (
-    document.querySelector('[role="dialog"]') ||
-    document.querySelector('[data-slot="dialog-content"]') ||
-    document.querySelector('[class*="modal" i]') ||
-    document.querySelector('[class*="dialog" i]') ||
-    document
+  const dialog = document.querySelector(
+    '[role="dialog"], [data-slot="dialog-content"], [class*="modal" i], [class*="dialog" i]'
   );
-}
-
-function cleanText(el) {
-  return el.innerText.trim().replace(/^[A-F]\s*\n?/, "").trim();
+  if (dialog && isVisible(dialog)) return dialog;
+  if (findOptionCards(document).length >= 2 || !IS_TOP) return document;
+  return null;
 }
 
 function getQuestion() {
   const scope = getScope();
-  let q = findQuestionIn(scope, true);
-  if (!q && scope !== document) q = findQuestionIn(document, true);
-  if (!q) q = findQuestionIn(scope, false);
-  if (!q && scope !== document) q = findQuestionIn(document, false);
-  return q;
-}
-
-function findQuestionIn(root, needPunct) {
-  const nodes = [...root.querySelectorAll("p,div,span,h1,h2,h3,h4")].filter((el) => {
-    if (el.children.length !== 0) return false;
-    if (!isVisible(el)) return false;
-    if (el.closest("button")) return false;
-    if (el.closest("#qa-root")) return false;
-    const t = el.innerText.trim();
-    if (t.length < 25 || t.length > 400) return false;
-    if (needPunct && !/[?:]/.test(t)) return false;
-    return true;
+  if (!scope) return null;
+  const nodes = [...scope.querySelectorAll("p,div,span,h1,h2,h3,h4")]
+    .filter((element) => {
+      if (element.children.length || !isVisible(element) ||
+          element.closest("button, [role='button'], #lqh-root")) return false;
+      const text = element.innerText.trim();
+      return text.length >= 15 && text.length <= 600 &&
+        !/^question\s+\d+\s+of\s+\d+$/i.test(text);
+    });
+  nodes.sort((a, b) => {
+    const aText = a.innerText.trim(), bText = b.innerText.trim();
+    const aScore = (/[?:]/.test(aText) ? 10000 : 0) + aText.length;
+    const bScore = (/[?:]/.test(bText) ? 10000 : 0) + bText.length;
+    return bScore - aScore;
   });
-  if (!nodes.length) return null;
-  nodes.sort((a, b) => b.innerText.length - a.innerText.length);
-  return nodes[0].innerText.trim();
+  return nodes[0] ? nodes[0].innerText.trim() : null;
 }
 
 function getOptionCards() {
   const scope = getScope();
-  let cards = findCardsIn(scope);
-  if (cards.length < 2 && scope !== document) cards = findCardsIn(document);
-  return cards;
+  return scope ? findOptionCards(scope) : [];
 }
 
-function findCardsIn(root) {
-  const btns = [...root.querySelectorAll("button")].filter((b) => {
-    const badge = b.querySelector("span");
-    return badge && /^[A-F]$/.test(badge.innerText.trim()) && isVisible(b);
-  });
-  if (btns.length >= 2) {
-    return btns.sort(
-      (a, b) =>
-        LETTERS.indexOf(a.querySelector("span").innerText.trim()) -
-        LETTERS.indexOf(b.querySelector("span").innerText.trim())
-    );
+function findOptionCards(root) {
+  const result = [];
+  const candidates = root.querySelectorAll("button, [role='radio'], [role='button'], label");
+  for (const element of candidates) {
+    if (!isVisible(element) || element.closest("#lqh-root")) continue;
+    const text = (element.innerText || element.textContent || "").trim();
+    const badge = element.querySelector("span")?.innerText.trim();
+    const match = (badge && /^([A-F])$/.exec(badge)) ||
+      /^\(?([A-F])(?:\s*[.):\-]\s*|\s+)\S/.exec(text);
+    if (!match) continue;
+    const letter = match[1];
+    const card = element.matches("label") ? element :
+      (element.closest("[role='radio']") || element.closest("button") || element);
+    if (!result.some((item) => item.element === card)) result.push({ letter, element: card });
   }
-  const cards = [];
-  for (const L of ["A", "B", "C", "D"]) {
-    const badge = [...root.querySelectorAll("span,div")].find(
-      (el) => el.children.length === 0 && el.innerText.trim() === L && isVisible(el)
-    );
-    if (!badge) break;
-    const card =
-      badge.closest("button") ||
-      badge.closest('[role="button"]') ||
-      badge.parentElement;
-    if (card && !cards.includes(card)) cards.push(card);
-  }
-  return cards;
+  result.sort((a, b) => LETTERS.indexOf(a.letter) - LETTERS.indexOf(b.letter));
+  return result.map((item) => item.element);
 }
 
-function findNextBtn() {
-  const scope = getScope();
-  const all = [...scope.querySelectorAll("button"), ...document.querySelectorAll("button")];
-  const seen = new Set();
-  const btns = all.filter((b) => {
-    if (seen.has(b)) return false;
-    seen.add(b);
-    if (b.closest("#qa-root")) return false;
-    return /next|submit|finish/i.test(b.innerText.trim()) && isVisible(b);
+function optionText(card) {
+  const text = (card.innerText || card.textContent || "").trim();
+  return text.replace(/^\s*\(?[A-F][\s.):\-]+/, "").replace(/\s+/g, " ").trim();
+}
+
+function findNextButton() {
+  const labeled = findButton(/next|submit|finish|check answers/i);
+  if (labeled) return labeled;
+
+  const scope = getScope() || document;
+  const scopeRect = scope === document
+    ? { left: 0, bottom: window.innerHeight, width: window.innerWidth }
+    : scope.getBoundingClientRect();
+  const options = getOptionCards();
+  const footerButtons = [...scope.querySelectorAll(
+    "button, [role='button'], input[type='button'], input[type='submit']"
+  )].filter((button) => {
+    if (button.closest("#lqh-root") || !isVisible(button)) return false;
+    if (options.some((card) => card === button || card.contains(button) || button.contains(card))) {
+      return false;
+    }
+    const label = buttonLabel(button);
+    if (/cancel|back|previous|close/i.test(label)) return false;
+    const rect = button.getBoundingClientRect();
+    return rect.bottom >= scopeRect.bottom - 115 &&
+      rect.left >= scopeRect.left + scopeRect.width * 0.55;
   });
-  if (!btns.length) return null;
-  const enabled = btns.find((b) => !b.disabled && b.getAttribute("aria-disabled") !== "true");
-  return enabled || btns[0];
+  footerButtons.sort((a, b) =>
+    b.getBoundingClientRect().right - a.getBoundingClientRect().right
+  );
+  return footerButtons[0] || null;
 }
 
-function logBtnDiagnostics() {
-  const btns = [...document.querySelectorAll("button")].filter(isVisible).slice(0, 12);
-  const info = btns.map((b) => {
-    const t = (b.innerText || "").trim().slice(0, 12) || "(empty)";
-    return t + (b.disabled ? "[disabled]" : "");
-  });
-  addLog("Buttons: " + (info.join(" | ") || "koi nahi"));
+function findButton(pattern) {
+  const scope = getScope() || document;
+  return [...scope.querySelectorAll("button, [role='button']")]
+    .find((button) => !button.closest("#lqh-root") && isVisible(button) &&
+      pattern.test(buttonLabel(button))) || null;
 }
 
-// ================= UI: BUBBLE + PANEL =================
-let panelOpen = false;
+function findPreviousButton() {
+  const scope = getScope() || document;
+  const candidates = [...scope.querySelectorAll(
+    "button, [role='button'], input[type='button'], input[type='submit']"
+  )].filter((button) =>
+    !button.closest("#lqh-root") && isVisible(button) &&
+    !button.disabled && button.getAttribute("aria-disabled") !== "true" &&
+    !isOptionControl(button)
+  );
+  const labeled = candidates.find((button) =>
+    /back|previous|prev(?:ious)?(?:\s|$)|question before|chevron-left|arrow-left|navigate-back/i
+      .test(buttonLabel(button))
+  ) || null;
+  if (labeled) return labeled;
 
-function bubbleAllowed() {
-  try { return localStorage.getItem("qa_bubble") === "1"; } catch { return false; }
-}
-
-function resetStartBtn() {
-  const b = document.querySelector("#qa-start");
-  if (b) {
-    b.disabled = false;
-    b.style.background = "#2563eb";
-    b.style.cursor = "pointer";
-    b.textContent = "▶ Start";
+  const next = findNextButton();
+  if (!next) return null;
+  for (let parent = next.parentElement, depth = 0;
+       parent && parent !== scope && depth < 5;
+       parent = parent.parentElement, depth++) {
+    const siblings = candidates.filter((button) => parent.contains(button));
+    const nextIndex = siblings.indexOf(next);
+    if (nextIndex < 1) continue;
+    for (let index = nextIndex - 1; index >= 0; index--) {
+      const candidate = siblings[index];
+      const hasNavigationHint = candidate.matches(
+        "input[type='button'], input[type='submit']"
+      ) || candidate.querySelector("svg, [data-icon], [class*='icon' i]") ||
+        candidate.hasAttribute("aria-label") || candidate.hasAttribute("title") ||
+        candidate.hasAttribute("data-testid") || candidate.hasAttribute("data-cy");
+      if (hasNavigationHint &&
+          candidate.getBoundingClientRect().left < next.getBoundingClientRect().left) {
+        return candidate;
+      }
+    }
   }
+  return null;
 }
 
-function ensureRoot() {
-  let root = document.getElementById("qa-root");
-  if (root && root.isConnected) return root;
-  root = document.createElement("div");
-  root.id = "qa-root";
-  (document.fullscreenElement || document.body).appendChild(root);
-  return root;
+function isOptionControl(element) {
+  return getOptionCards().some((card) =>
+    card === element || card.contains(element) || element.contains(card)
+  );
 }
 
-function ensureBubble(root) {
-  if (root.querySelector("#qa-bubble")) return;
-  const b = document.createElement("div");
-  b.id = "qa-bubble";
-  b.textContent = "🤖";
-  b.style.cssText =
-    "position:fixed;bottom:20px;right:20px;z-index:2147483647;width:46px;height:46px;" +
-    "background:#1e293b;border-radius:50%;display:flex;align-items:center;justify-content:center;" +
-    "font-size:22px;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.45);user-select:none";
-  b.title = "Quiz Auto — panel kholo";
-  b.addEventListener("click", togglePanel);
-  root.appendChild(b);
+function buttonLabel(button) {
+  return [
+    button.innerText,
+    button.textContent,
+    button.getAttribute("aria-label"),
+    button.getAttribute("title"),
+    button.getAttribute("data-testid"),
+    button.getAttribute("data-cy")
+  ].filter(Boolean).join(" ").trim();
 }
 
-function ensurePanel(root) {
-  if (root.querySelector("#qa-panel")) return;
-  const panel = document.createElement("div");
-  panel.id = "qa-panel";
-  panel.innerHTML = `
-    <div style="position:fixed;top:15px;right:15px;z-index:2147483647;font-family:sans-serif;
-                width:240px;background:#1e293b;color:#fff;border-radius:10px;padding:12px;
-                box-shadow:0 4px 20px rgba(0,0,0,.4)">
-      <div style="font-weight:bold;font-size:13px;margin-bottom:8px">🤖 Quiz Auto</div>
-      <button id="qa-start" style="all:unset;width:100%;box-sizing:border-box;background:#2563eb;color:#fff;
-              text-align:center;padding:8px;border-radius:6px;font-size:13px;cursor:pointer">▶ Start</button>
-      <button id="qa-test" style="all:unset;width:100%;box-sizing:border-box;background:#0f766e;color:#fff;
-              text-align:center;padding:8px;border-radius:6px;font-size:13px;cursor:pointer;margin-top:6px">🧪 Click Test</button>
-      <button id="qa-stop" style="all:unset;width:100%;box-sizing:border-box;background:#7f1d1d;color:#fff;
-              text-align:center;padding:8px;border-radius:6px;font-size:13px;cursor:pointer;margin-top:6px">■ Stop (reload page)</button>
-      <div id="qa-log" style="margin-top:8px;font-size:11px;color:#94a3b8;max-height:130px;overflow-y:auto"></div>
-    </div>`;
-  root.appendChild(panel);
-
-  const startBtn = panel.querySelector("#qa-start");
-  startBtn.onclick = () => {
-    if (startBtn.disabled) return;
-    startBtn.disabled = true;
-    startBtn.style.background = "#475569";
-    startBtn.style.cursor = "not-allowed";
-    startBtn.textContent = "⏳ Running...";
-    addLog("Start hua...");
-    chrome.runtime.sendMessage({ type: "START" }).catch(() => {});
-  };
-  panel.querySelector("#qa-test").onclick = async () => {
-    addLog("🧪 Click test: Option A...");
-    const cards = getOptionCards();
-    if (!cards.length) { addLog("⚠ Koi option nahi mila"); return; }
-    await clickEl(cards[0]);
-    await sleep(600);
-    addLog(isSelected(cards[0]) || isSelected(getOptionCards()[0])
-      ? "✅ A select ho gaya!" : "⚠ A select nahi hua");
-  };
-  panel.querySelector("#qa-stop").onclick = () => location.reload();
+function isSelected(element, siblingCards) {
+  const candidates = [element, ...element.querySelectorAll(
+    "[aria-checked], [aria-pressed], [aria-selected], [data-state], input[type='radio'], input[type='checkbox']"
+  )];
+  for (const candidate of candidates) {
+    const aria = candidate.getAttribute("aria-checked") ??
+      candidate.getAttribute("aria-pressed") ??
+      candidate.getAttribute("aria-selected");
+    if (aria !== null) return aria === "true";
+    if (candidate.matches("input[type='radio'], input[type='checkbox']")) return candidate.checked;
+    const state = candidate.getAttribute("data-state");
+    if (state === "checked" || state === "on") return true;
+    if (state === "unchecked" || state === "off") return false;
+  }
+  if (/\b(selected|checked|active)\b/i.test(String(element.className))) return true;
+  const cards = siblingCards || getOptionCards();
+  if (cards.length < 2) return false;
+  const signature = selectionFingerprint(element);
+  const signatures = cards.map(selectionFingerprint);
+  return signatures.filter((item) => item === signature).length === 1 &&
+    new Set(signatures).size > 1;
 }
 
-function togglePanel() {
-  if (!IS_TOP) return;
-  panelOpen = !panelOpen;
-  try { localStorage.setItem("qa_bubble", "1"); } catch {}
-  ensureUI();
+function selectionFingerprint(element) {
+  const style = getComputedStyle(element);
+  return [
+    element.className,
+    element.getAttribute("aria-checked"),
+    element.getAttribute("aria-pressed"),
+    element.getAttribute("aria-selected"),
+    element.getAttribute("data-state"),
+    style.backgroundColor,
+    style.borderColor,
+    style.boxShadow,
+    style.color
+  ].join("|");
 }
 
-function ensureUI() {
-  if (IS_GPT || !IS_TOP) return;
-  if (!panelOpen && !bubbleAllowed()) return;
-  const root = ensureRoot();
-  ensureBubble(root);
-  if (panelOpen) ensurePanel(root);
-  else root.querySelector("#qa-panel")?.remove();
+function isVisible(element) {
+  const rect = element.getBoundingClientRect();
+  return rect.width > 5 && rect.height > 5 &&
+    getComputedStyle(element).visibility !== "hidden";
 }
 
-function addLog(text) {
-  const log = document.querySelector("#qa-log");
-  if (!log) return;
+function setStatus(text) {
+  chrome.runtime.sendMessage({ type: "STATUS", text }).catch(() => {});
+}
+
+function showStatus(text) {
+  const root = ensurePanel();
   const line = document.createElement("div");
   line.textContent = "• " + text;
-  line.style.marginBottom = "2px";
-  log.appendChild(line);
-  log.scrollTop = log.scrollHeight;
+  line.style.cssText = "margin-top:4px;overflow-wrap:anywhere";
+  root.querySelector("#lqh-log").appendChild(line);
+  while (root.querySelector("#lqh-log").children.length > 8) {
+    root.querySelector("#lqh-log").firstElementChild.remove();
+  }
 }
 
-// ================= FULLSCREEN FIX =================
-function keepInFullscreen() {
-  const fs = document.fullscreenElement;
-  const root = document.getElementById("qa-root");
-  if (fs && root && !fs.contains(root)) fs.appendChild(root);
-}
-
-document.addEventListener("fullscreenchange", keepInFullscreen);
-setInterval(() => { ensureUI(); keepInFullscreen(); }, 2000);
-
-setInterval(() => {
-  try { chrome.runtime.sendMessage({ type: "KEEPALIVE" }).catch(() => {}); } catch {}
-}, 15000);
-
-if (!IS_GPT && IS_TOP) {
-  const boot = () => { ensureUI(); keepInFullscreen(); };
-  if (document.readyState === "complete") setTimeout(boot, 800);
-  else window.addEventListener("load", () => setTimeout(boot, 800));
+function ensurePanel() {
+  let root = document.getElementById("lqh-root");
+  if (root) return root;
+  root = document.createElement("div");
+  root.id = "lqh-root";
+  root.style.cssText = "all:initial;position:fixed;right:16px;bottom:16px;z-index:2147483647";
+  root.innerHTML = '<div style="width:260px;padding:10px;background:#172033;color:#fff;border-radius:9px;font:12px system-ui,sans-serif;box-shadow:0 3px 16px #0006"><b>Local Quiz Helper</b><div id="lqh-log" style="max-height:130px;overflow:auto;margin-top:5px"></div></div>';
+  (document.fullscreenElement || document.body).appendChild(root);
+  return root;
 }

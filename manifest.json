@@ -1,27 +1,27 @@
 {
   "manifest_version": 3,
-  "name": "Quiz Auto Solver",
-  "version": "3.0",
-  "description": "Quiz Solver",
-  "permissions": ["tabs", "debugger"],
-  "host_permissions": ["<all_urls>"],
-  "background": { "service_worker": "background.js" },
-  "action": {},
-  "commands": {
-    "toggle-panel": {
-      "suggested_key": { "default": "Ctrl+Shift+Y" },
-      "description": "Quiz panel kholo/band karo"
-    }
+  "name": "Quiz Batch Helper",
+  "version": "5.0.0",
+  "description": "Scans quiz questions, asks ChatGPT once for the full batch, and applies validated answers.",
+  "permissions": ["activeTab", "tabs", "storage"],
+  "host_permissions": ["<all_urls>", "https://chatgpt.com/*", "https://chat.openai.com/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html"
   },
   "content_scripts": [
     {
-      "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"],
-      "js": ["content-gpt.js"]
-    },
-    {
       "matches": ["<all_urls>"],
       "js": ["content-quiz.js"],
-      "all_frames": true
+      "all_frames": true,
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"],
+      "js": ["gpt-protocol.js", "content-gpt.js"],
+      "run_at": "document_idle"
     }
   ]
 }

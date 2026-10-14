@@ -1,283 +1,262 @@
-// ============================================================
-// content-gpt.js — SINGLE + BATCH (ek call me sare answers JSON)
-// ============================================================
+"use strict";
 
-const LETTERS = ["A", "B", "C", "D", "E", "F"];
-const T_POLL = 400;
-const T_COMPOSER = 300;
-const NEW_CHAT_AFTER = 25;
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+(function installChatGptContent(root) {
+if (root.__quizBatchChatGptContentInstalled) return;
+root.__quizBatchChatGptContentInstalled = true;
 
-function sendBG(payload) {
-  try { chrome.runtime.sendMessage(payload).catch(() => {}); } catch {}
-}
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const POLL_MS = 400;
+let answering = false;
+let activeRunId = null;
 
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.type === "ANSWER_THIS") {
-    sendResponse({ ok: true });
-    answerFlow(msg.question, msg.options || []);
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type !== "ANSWER_BATCH") return;
+  if (answering) {
+    sendResponse({ ok: false, error: "ChatGPT request already running." });
+    return;
   }
-  if (msg.type === "ANSWER_ALL") {
-    sendResponse({ ok: true });
-    answerAllFlow(msg.questions || []);
+  if (!Array.isArray(message.questions) || !message.questions.length) {
+    sendResponse({ ok: false, error: "Question batch empty." });
+    return;
   }
+
+  answering = true;
+  activeRunId = message.runId;
+  sendResponse({ ok: true });
+  answerBatch(message.runId, message.questions)
+    .catch(async (error) => {
+      await sendStatus("ChatGPT error: " + error.message);
+      await chrome.runtime.sendMessage({
+        type: "GPT_ERROR",
+        runId: message.runId,
+        error: error.message
+      }).catch(() => {});
+    })
+    .finally(() => {
+      answering = false;
+      activeRunId = null;
+    });
 });
 
-// ---------- TEXT CLEANING ----------
-function cleanLine(t) {
-  return String(t || "")
-    .replace(/QUESTION\s+\d+\s+OF\s+\d+/gi, " ")
-    .replace(/Concept\s+Check/gi, " ")
-    .replace(/[*_`#>|]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
+async function answerBatch(runId, questions) {
+  await startFreshChat();
+  const prompt = GptProtocol.buildBatchPrompt(questions);
+  let reply = null;
 
-function cleanOption(t) {
-  return cleanLine(t)
-    .replace(/^\(([A-F])\)\s*/, "")
-    .replace(/^([A-F])[\.\):]\s*/, "")
-    .replace(/^([A-F])\s*[-–]\s+/, "")
-    .trim();
-}
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    await sendStatus("🧠 ChatGPT ko sare " + questions.length + " questions ek saath bhej raha hun" +
+      (attempt > 1 ? " (JSON retry)" : "..."));
+    const composer = await waitForComposer(60);
+    if (!composer) throw new Error("Composer nahi mila; ChatGPT login/page check karein.");
+    const attemptPrompt = attempt === 1 ? prompt :
+      prompt + "\n\nReminder: return complete valid JSON only.";
+    const previousReplies = new Set(readAssistantReplies());
+    await typeInto(composer, attemptPrompt);
+    await sendStatus("✍️ Question batch composer mein likha; verify kar raha hun...");
+    if (!composerContains(composer, attemptPrompt)) {
+      throw new Error("ChatGPT composer mein prompt enter nahi hua; text manually check karein.");
+    }
+    await sendStatus("⏳ ChatGPT Send button ready hone ka wait...");
+    const submitted = await submitPrompt(composer, 20);
+    if (!submitted) {
+      throw new Error("Prompt composer mein hai, lekin Send button/form submit nahi hua.");
+    }
+    await sendStatus("📤 Send click kiya; ChatGPT ke valid answer ka wait...");
+    reply = await waitForReply(previousReplies, 240, questions);
+    if (!reply) continue;
+    await sendStatus("💬 ChatGPT ka jawab mil gaya; JSON validate karke quiz ko bhej raha hun...");
 
-// ---------- BATCH PROMPT ----------
-function buildBatchPrompt(mcqs) {
-  const parts = mcqs.map((q) => {
-    const opts = (q.options || []).slice(0, 6)
-      .map((o, i) => LETTERS[i] + ") " + cleanOption(o))
-      .join("\n");
-    return q.n + ") " + cleanLine(q.q) + "\n" + opts;
-  });
-  return (
-    "You are answering a multiple-choice quiz. " +
-    "Reply with ONLY a JSON object — no markdown, no code fences, no explanation — exactly like:\n" +
-    '{"answers":[{"n":1,"a":"B"},{"n":2,"a":"C"}]}\n' +
-    '"a" = correct option letter for question "n". Best guess if unsure.\n\n' +
-    "Questions:\n\n" + parts.join("\n\n")
-  );
-}
-
-function buildPrompt(question, options) {
-  const q = cleanLine(question);
-  const opts = options
-    .slice(0, 6)
-    .map((o, i) => LETTERS[i] + ") " + cleanOption(o))
-    .join("\n");
-  return (
-    "You are answering a multiple-choice quiz question. " +
-    "Reply with ONLY the letter of the correct option (example: B). " +
-    "No explanation, no extra words, no punctuation — just ONE letter. " +
-    "If unsure, reply with your best guess letter.\n\n" +
-    "Question: " + q + "\n\nOptions:\n" + opts
-  );
-}
-
-// ---------- PARSING ----------
-function extractLetter(text, numOpts) {
-  if (!text) return null;
-  const t = String(text).replace(/\*\*/g, "").trim();
-  const max = Math.max(2, Math.min(numOpts || 6, 6));
-  const ok = (L) => LETTERS.indexOf(L) < max;
-  let m = t.match(/(?:correct\s+)?answer\s*(?:is|:|=)?\s*\(?\s*([A-F])\b/i);
-  if (m && ok(m[1].toUpperCase())) return m[1].toUpperCase();
-  m = t.match(/^\s*\(?\s*([A-F])\s*\)?\s*(?:[\.\):,]|$)/);
-  if (m && ok(m[1].toUpperCase())) return m[1].toUpperCase();
-  m = t.match(/\b([A-F])\b/);
-  if (m && ok(m[1].toUpperCase())) return m[1].toUpperCase();
-  return null;
-}
-
-function parseAnswers(text) {
-  if (!text) return null;
-  const t = String(text).replace(/```json/gi, "").replace(/```/g, "").trim();
-  const out = {};
-  const m = t.match(/\{[\s\S]*\}/);
-  if (m) {
+    let answers;
     try {
-      const obj = JSON.parse(m[0]);
-      if (Array.isArray(obj.answers)) {
-        for (const it of obj.answers) {
-          const n = parseInt(it && (it.n ?? it.number ?? it.q), 10);
-          const a = String((it && (it.a ?? it.ans ?? it.answer)) || "").toUpperCase();
-          const L = (a.match(/\b([A-F])\b/) || [])[1];
-          if (n >= 1 && L) out[n] = L;
-        }
-        if (Object.keys(out).length) return out;
-      }
-      for (const k of Object.keys(obj || {})) {
-        const n = parseInt(k, 10);
-        const L = (String(obj[k]).toUpperCase().match(/\b([A-F])\b/) || [])[1];
-        if (n >= 1 && L) out[n] = L;
-      }
-      if (Object.keys(out).length) return out;
-    } catch {}
+      answers = GptProtocol.parseBatchAnswers(reply, questions);
+    } catch (error) {
+      if (attempt === 2) throw error;
+      await sendStatus("⚠ Answer JSON incomplete/invalid; ek baar poora batch retry...");
+      continue;
+    }
+    await sendStatus("✅ ChatGPT se " + Object.keys(answers).length +
+      "/" + questions.length + " valid answers mile; quiz apply ho raha hai...");
+    const result = await chrome.runtime.sendMessage({
+      type: "BATCH_ANSWERS",
+      runId,
+      answers
+    });
+    if (!result || !result.ok) {
+      throw new Error((result && result.error) || "Quiz ne answer batch accept nahi kiya.");
+    }
+    return;
   }
-  // Fallback: "1. B" / "1: B" / "1) B" lines
-  const re = /(\d+)\s*[:.\)\-]\s*\(?([A-F])\)?\b/g;
-  let mm;
-  while ((mm = re.exec(t))) {
-    const n = parseInt(mm[1], 10);
-    if (n >= 1 && !out[n]) out[n] = mm[2];
-  }
-  return Object.keys(out).length ? out : null;
+  throw new Error("ChatGPT reply timeout hua; login/network check karke dobara Start karein.");
 }
 
-// ---------- CHATGPT AUTOMATION ----------
-async function waitForComposer(maxTries = 12) {
-  for (let i = 0; i < maxTries; i++) {
-    const c = document.querySelector(
-      "#prompt-textarea, div.ProseMirror[contenteditable='true']"
+async function startFreshChat() {
+  const newChat = document.querySelector(
+    'button[aria-label="New chat"], a[aria-label="New chat"], a[href="/"]'
+  );
+  if (assistantMessages().length && newChat) {
+    newChat.click();
+    await sleep(1200);
+  }
+}
+
+async function waitForComposer(polls) {
+  for (let index = 0; index < polls; index++) {
+    const composer = [...document.querySelectorAll(
+      "#prompt-textarea, [data-testid='prompt-textarea'], textarea[placeholder], [contenteditable='true']"
+    )].find((element) =>
+      isVisible(element) &&
+      element.getAttribute("aria-disabled") !== "true" &&
+      !element.disabled &&
+      !element.closest("#search, [role='search']")
     );
-    if (c) return c;
-    await sleep(T_COMPOSER);
+    if (composer) return composer;
+    await sleep(POLL_MS);
   }
   return null;
 }
 
-async function typeInto(el, text) {
-  el.focus();
+async function typeInto(element, text) {
+  element.focus();
   await sleep(100);
-  if (el.tagName === "TEXTAREA") {
-    el.value = text;
-    el.dispatchEvent(new Event("input", { bubbles: true }));
+  if (element instanceof HTMLTextAreaElement) {
+    const setter = Object.getOwnPropertyDescriptor(
+      HTMLTextAreaElement.prototype,
+      "value"
+    ).set;
+    setter.call(element, text);
+    element.dispatchEvent(new InputEvent("input", {
+      bubbles: true,
+      inputType: "insertText",
+      data: text
+    }));
   } else {
-    document.execCommand("selectAll", false, null);
-    document.execCommand("insertText", false, text);
+    const selection = document.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(element);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    const inserted = document.execCommand("insertText", false, text);
+    if (!inserted || !composerContains(element, text)) {
+      element.replaceChildren(document.createTextNode(text));
+    }
+    element.dispatchEvent(new InputEvent("input", {
+      bubbles: true,
+      inputType: "insertText",
+      data: text
+    }));
   }
   await sleep(150);
+  if (!composerContains(element, text)) {
+    throw new Error("ChatGPT composer ne prompt enter nahi kiya; input manually check karein.");
+  }
 }
 
-function clickSend() {
-  const btn =
-    document.querySelector('[data-testid="send-button"]') ||
-    document.querySelector('button[aria-label*="Send" i]');
-  if (btn && !btn.disabled) { btn.click(); return true; }
+function composerContains(element, text) {
+  const value = element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement
+    ? element.value
+    : element.innerText || element.textContent || "";
+  return value.trim() === text.trim();
+}
+
+async function submitPrompt(composer, polls) {
+  for (let index = 0; index < polls; index++) {
+    const form = composer.closest("form");
+    const candidates = document.querySelectorAll(
+      'button[data-testid*="send" i], button[aria-label*="send" i], button[title*="send" i], button[type="submit"], input[type="submit"]'
+    );
+    const button = [...candidates].find((element) =>
+      isVisible(element) &&
+      !element.disabled &&
+      element.getAttribute("aria-disabled") !== "true" &&
+      (!form || form.contains(element) ||
+        element.matches('[data-testid*="send" i], [aria-label*="send" i], [title*="send" i]'))
+    );
+    if (button) {
+      button.click();
+      return true;
+    }
+    if (form && index === Math.min(9, polls - 1)) {
+      form.requestSubmit();
+      return true;
+    }
+    await sleep(POLL_MS);
+  }
   return false;
 }
 
-async function waitReply(prevCount) {
-  for (let i = 0; i < 150; i++) {
-    await sleep(T_POLL);
-    const stop = document.querySelector(
-      '[data-testid="stop-button"], button[aria-label*="Stop" i]'
-    );
-    if (stop) continue;
-    const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
-    if (msgs.length > prevCount) {
-      const txt = (msgs[msgs.length - 1].innerText || "").trim();
-      if (txt) {
-        await sleep(300);
-        const msgs2 = document.querySelectorAll('[data-message-author-role="assistant"]');
-        if (msgs2.length === msgs.length &&
-            (msgs2[msgs2.length - 1].innerText || "").trim() === txt) {
-          return txt;
-        }
+function assistantMessages() {
+  return [...document.querySelectorAll('[data-message-author-role="assistant"]')];
+}
+
+async function waitForReply(previousReplies, polls, questions) {
+  let lastText = "";
+  let stablePolls = 0;
+  for (let index = 0; index < polls; index++) {
+    await sleep(POLL_MS);
+    const replies = readAssistantReplies().filter((text) => !previousReplies.has(text));
+    for (const current of replies.reverse()) {
+      try {
+        GptProtocol.parseBatchAnswers(current, questions);
+        return current;
+      } catch {}
+      if (current === lastText) {
+        stablePolls++;
+        if (!isGenerating() && stablePolls >= 3) return current;
+      } else {
+        lastText = current;
+        stablePolls = 0;
       }
     }
+    if (isGenerating()) stablePolls = 0;
   }
   return null;
 }
 
-async function maybeNewChat() {
-  try {
-    const msgs = document.querySelectorAll('[data-message-author-role="assistant"]').length;
-    if (msgs < NEW_CHAT_AFTER) return;
-    const btn =
-      document.querySelector('button[aria-label="New chat"]') ||
-      document.querySelector('a[aria-label="New chat"]') ||
-      document.querySelector('a[href="/"]');
-    if (btn) { btn.click(); await sleep(2000); }
-  } catch {}
+function readAssistantReplies() {
+  const marked = [...document.querySelectorAll(
+    '[data-message-author-role="assistant"], [data-testid*="assistant-message" i]'
+  )];
+  const fallback = [...document.querySelectorAll(
+    "main p, main pre, main code, main [class*='markdown' i], main [data-testid^='conversation-turn-']"
+  )].filter((element) => {
+    if (element.closest(
+      '[data-message-author-role="user"], #prompt-textarea, [contenteditable="true"]'
+    )) return false;
+    const text = (element.innerText || element.textContent || "").trim();
+    return text.length > 10 && text.length <= 12000 &&
+      /["']answers["']\s*:|\{\s*["']answers["']/i.test(text) &&
+      !/Answer every multiple-choice question below/i.test(text);
+  });
+  const seen = new Set();
+  return [...marked, ...fallback]
+    .filter(isVisible)
+    .map((element) => (element.innerText || element.textContent || "").trim())
+    .filter((text) => {
+      if (!text || seen.has(text)) return false;
+      seen.add(text);
+      return true;
+    });
 }
 
-// ---------- FLOWS ----------
-let busy = false;
-
-// BATCH: sare questions -> 1 call -> JSON answers
-async function answerAllFlow(questions) {
-  if (busy) return;
-  busy = true;
-  try {
-    const mcqs = questions.filter((q) => q.type === "mcq" && (q.options || []).length >= 2);
-    if (!mcqs.length) {
-      sendBG({ type: "ANSWERS", answers: {} });
-      return;
-    }
-    await maybeNewChat();
-
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      sendBG({ type: "STATUS", text: "🧠 " + mcqs.length + " questions EK saath GPT ko..." + (attempt > 1 ? " (retry)" : "") });
-      const composer = await waitForComposer();
-      if (!composer) {
-        sendBG({ type: "STATUS", text: "⚠ ChatGPT composer nahi mila — login check karo" });
-        return;
-      }
-      const prevCount = document.querySelectorAll('[data-message-author-role="assistant"]').length;
-
-      let prompt = buildBatchPrompt(mcqs);
-      if (attempt > 1) {
-        prompt += "\n\nREMINDER: Reply with ONLY the JSON object. No markdown, no explanation.";
-      }
-
-      await typeInto(composer, prompt);
-      if (!clickSend()) {
-        composer.dispatchEvent(new KeyboardEvent("keydown", {
-          key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true,
-        }));
-      }
-
-      const reply = await waitReply(prevCount);
-      if (!reply) { sendBG({ type: "STATUS", text: "⚠ Reply nahi aya" }); continue; }
-
-      const answers = parseAnswers(reply);
-      if (answers && Object.keys(answers).length) {
-        sendBG({ type: "STATUS", text: "🎯 " + Object.keys(answers).length + " answers parse ho gaye" });
-        sendBG({ type: "ANSWERS", answers });
-        return;
-      }
-      sendBG({ type: "STATUS", text: 'JSON clear nahi: "' + reply.slice(0, 50) + '"' });
-    }
-    sendBG({ type: "STATUS", text: "⚠ Batch parse fail — retry hoga" });
-  } finally {
-    busy = false;
-  }
+function isGenerating() {
+  return [...document.querySelectorAll(
+    '[data-testid="stop-button"], button[aria-label*="Stop generating" i]'
+  )].some((button) => {
+    const style = getComputedStyle(button);
+    const rect = button.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0 &&
+      style.visibility !== "hidden" && style.display !== "none";
+  });
 }
 
-// SINGLE (fallback mode)
-async function answerFlow(question, options) {
-  if (busy) return;
-  busy = true;
-  try {
-    await maybeNewChat();
-    let composer = await waitForComposer();
-    if (!composer) {
-      sendBG({ type: "STATUS", text: "⚠ ChatGPT composer nahi mila — login check karo" });
-      return;
-    }
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      sendBG({ type: "STATUS", text: "ChatGPT soch raha hai" + (attempt > 1 ? " (retry)" : "...") });
-      const prevCount = document.querySelectorAll('[data-message-author-role="assistant"]').length;
-      let prompt = buildPrompt(question, options);
-      if (attempt > 1) {
-        prompt += "\n\nREMINDER: Reply with ONLY one letter (A, B, C, D or E). Nothing else.";
-      }
-      composer = await waitForComposer();
-      if (!composer) break;
-      await typeInto(composer, prompt);
-      if (!clickSend()) {
-        composer.dispatchEvent(new KeyboardEvent("keydown", {
-          key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true,
-        }));
-      }
-      const reply = await waitReply(prevCount);
-      if (!reply) { sendBG({ type: "STATUS", text: "⚠ Reply nahi aya" }); continue; }
-      const letter = extractLetter(reply, options.length);
-      if (letter) { sendBG({ type: "ANSWER", letter }); return; }
-      sendBG({ type: "STATUS", text: 'Clear nahi: "' + reply.slice(0, 35) + '"' });
-    }
-    sendBG({ type: "STATUS", text: "⚠ Answer nahi mila — retry hoga" });
-  } finally {
-    busy = false;
-  }
+function isVisible(element) {
+  const style = getComputedStyle(element);
+  const rect = element.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0 &&
+    style.visibility !== "hidden" && style.display !== "none";
 }
+
+function sendStatus(text) {
+  return chrome.runtime.sendMessage({ type: "STATUS", text }).catch(() => null);
+}
+})(globalThis);

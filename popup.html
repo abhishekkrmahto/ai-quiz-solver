@@ -1,42 +1,27 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
   <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Quiz Batch Helper</title>
   <style>
-    body {
-      width: 240px;
-      font-family: sans-serif;
-      padding: 14px;
-      margin: 0;
-    }
-    button {
-      width: 100%;
-      padding: 10px;
-      font-size: 15px;
-      cursor: pointer;
-      background: #2563eb;
-      color: white;
-      border: none;
-      border-radius: 8px;
-      font-weight: bold;
-    }
-    button:hover {
-      background: #1d4ed8;
-    }
-    p {
-      font-size: 12px;
-      color: #555;
-      margin: 10px 0 0;
-      line-height: 1.4;
-    }
+    body { width: 270px; margin: 0; padding: 16px; color: #172033; font: 14px system-ui, sans-serif; }
+    h1 { margin: 0 0 8px; font-size: 17px; }
+    p { margin: 8px 0 12px; color: #526078; line-height: 1.45; font-size: 12px; }
+    button { width: 100%; margin-top: 7px; padding: 9px; border: 0; border-radius: 7px; color: white; background: #1d4ed8; font-weight: 650; cursor: pointer; }
+    button:hover { filter: brightness(.94); }
+    #stop { background: #475569; }
+    #status { min-height: 18px; margin-top: 10px; color: #334155; font-size: 12px; }
+    .note { padding-top: 8px; border-top: 1px solid #e2e8f0; }
   </style>
 </head>
 <body>
-  <button id="start">▶ Start Auto Solve</button>
-  <p>
-    Quiz wale tab pe click karo. ChatGPT background mein khulega aur
-    answers khud tick + NEXT hote jayenge.
-  </p>
+  <h1>Quiz Batch Helper</h1>
+  <p>Scan ke baad sare questions ek batch mein ChatGPT ko bhejta hai, phir answers quiz mein select/submit karta hai.</p>
+  <button id="start">▶ Scan &amp; solve batch</button>
+  <button id="stop">■ Stop</button>
+  <div id="status" role="status" aria-live="polite"></div>
+  <p class="note">ChatGPT website mein logged in hona zaroori hai. 60 se zyada, unsupported ya incomplete scan safe-stop karega. Har answer submit se pehle select verify hota hai.</p>
   <script src="popup.js"></script>
 </body>
 </html>

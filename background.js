@@ -1,301 +1,306 @@
-// ============================================================
-// background.js — BATCH mode: Collect -> 1 GPT call -> Apply
-// ============================================================
+"use strict";
 
-let quizTabId = null;
+let activeRun = null;
 let gptTabId = null;
-let qCount = 0;
-let watchdog = null;
-let wdKind = "quiz";
-let pendingQ = null;
-let lastQ = null;
-let lastLetter = null;
-let sameQCount = 0;
-let recoverUsed = 0;
-let lastStart = 0;
-let lastBatch = null;
-const MAX_Q = 100;
-const GPT_URL = "https://chatgpt.com/";
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+let gptTabOwned = false;
+const RUN_STORAGE_KEY = "activeQuizRun";
 
-chrome.action.onClicked.addListener(async (tab) => {
-  try { await chrome.tabs.sendMessage(tab.id, { type: "SHOW_PANEL" }); } catch {}
-});
-
-chrome.commands.onCommand.addListener(async (command) => {
-  if (command !== "toggle-panel") return;
-  const tab = await getActiveTab();
-  if (!tab) return;
-  try { await chrome.tabs.sendMessage(tab.id, { type: "SHOW_PANEL" }); } catch {}
-});
-
-chrome.debugger.onDetach.addListener((source) => {
-  if (quizTabId && source.tabId === quizTabId) {
-    status("⚠ Debugger detach — Start dobara dabao");
-  }
-});
-
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  (async () => {
-    try {
-      switch (msg.type) {
-        case "KEEPALIVE":
-          break;
-
-        case "STATUS":
-          sendToTab(quizTabId, { type: "STATUS", text: msg.text });
-          break;
-
-        case "START": {
-          const sid = sender.tab ? sender.tab.id : null;
-          if (sid != null && sid === quizTabId && Date.now() - lastStart < 10000) {
-            status("Start dobara dabaya — already chal raha hai ✓");
-            break;
-          }
-          lastStart = Date.now();
-
-          quizTabId = sid != null ? sid : (await getActiveTab()).id;
-          qCount = 0; pendingQ = null; lastQ = null; lastLetter = null;
-          sameQCount = 0; recoverUsed = 0; lastBatch = null;
-          try { chrome.action.setBadgeText({ text: "" }); } catch {}
-
-          status("📦 Batch mode — pehle sare questions collect honge");
-
-          const [, att] = await Promise.all([ensureGptTab(), ensureDbg(quizTabId)]);
-          if (!att) {
-            status("⚠ Debugger FAIL — F12 band karo, page refresh, phir Start");
-            return;
-          }
-          status("🔐 Debugger ready — clicks REAL");
-
-          status("⏳ 2s wait...");
-          await sleep(2000);
-
-          status("Shuru! 🚀");
-          armWatchdog(120, "Collection slow — page dekho", "none");
-          sendToTab(quizTabId, { type: "START_FLOW" });
-          break;
-        }
-
-        // ===== SINGLE MODE (fallback jab badge na mile) =====
-        case "QUESTION": {
-          clearWatchdog();
-          if (msg.question === lastQ && lastLetter) {
-            sameQCount++;
-            if (sameQCount <= 4) {
-              status("Same Q — dobara try (" + sameQCount + "/4)");
-              await sendToTab(quizTabId, { type: "CLICK_ANSWER", letter: lastLetter });
-              armWatchdog(15, "Click/Next baar baar fail", "quiz");
-            } else {
-              status("⚠ Same Q baar baar — page dekho");
-            }
-            break;
-          }
-          sameQCount = 0;
-          recoverUsed = 0;
-          qCount++;
-          if (qCount > MAX_Q) return;
-          pendingQ = msg.question;
-          status("Q" + qCount + " -> ChatGPT");
-          gptTabId = await ensureGptTab();
-          const ok = gptTabId != null && (await sendToTabRetry(gptTabId, {
-            type: "ANSWER_THIS",
-            question: msg.question,
-            options: msg.options,
-          }, 6, 800));
-          if (ok) {
-            armWatchdog(30, "ChatGPT slow", "quiz");
-          } else {
-            status("⚠ ChatGPT tab dead — 3s me retry...");
-            gptTabId = null;
-            await sleep(3000);
-            sendToTab(quizTabId, { type: "GET_QUESTION" });
-          }
-          break;
-        }
-
-        case "ANSWER": {
-          clearWatchdog();
-          lastQ = pendingQ;
-          lastLetter = msg.letter;
-          status("Answer: " + msg.letter);
-          await sendToTab(quizTabId, { type: "CLICK_ANSWER", letter: msg.letter });
-          armWatchdog(15, "Click/Next fail", "quiz");
-          break;
-        }
-
-        // ===== BATCH MODE =====
-        case "ALL_QUESTIONS": {
-          clearWatchdog();
-          lastBatch = msg.questions || [];
-          const mcq = lastBatch.filter((q) => q.type === "mcq").length;
-          status("📦 " + lastBatch.length + " questions mile (" + mcq + " MCQ, baaki NULL)");
-          status("🧠 GPT ko EK saath bheja...");
-          gptTabId = await ensureGptTab();
-          const okB = gptTabId != null && (await sendToTabRetry(gptTabId, {
-            type: "ANSWER_ALL",
-            questions: lastBatch,
-          }, 6, 800));
-          if (okB) {
-            armWatchdog(90, "GPT batch slow", "gpt");
-          } else {
-            status("⚠ GPT tab dead — 3s me retry...");
-            gptTabId = null;
-            await sleep(3000);
-            sendToTab(quizTabId, { type: "START_FLOW" });
-          }
-          break;
-        }
-
-        case "ANSWERS": {
-          clearWatchdog();
-          recoverUsed = 0;
-          const n = Object.keys(msg.answers || {}).length;
-          status("🎯 " + n + " answers aa gaye — tick + submit shuru");
-          sendToTab(quizTabId, { type: "APPLY_ANSWERS", answers: msg.answers || {} });
-          armWatchdog(90, "Apply slow", "quiz");
-          break;
-        }
-
-        case "FINISHED": {
-          clearWatchdog();
-          let v = null;
-          try {
-            v = await Promise.race([
-              chrome.tabs.sendMessage(quizTabId, { type: "VERIFY_FINISH" }).catch(() => null),
-              new Promise((res) => setTimeout(() => res(null), 3000)),
-            ]);
-          } catch {}
-          if (v && v.done === false) {
-            status("⚠ False finish pakda! Continue...");
-            await sleep(1000);
-            armWatchdog(30, "Question nahi mila", "quiz");
-            sendToTab(quizTabId, { type: "GET_QUESTION" });
-            break;
-          }
-          status("🎉 Quiz finished!");
-          try { chrome.action.setBadgeText({ text: "DONE" }); } catch {}
-          break;
-        }
-
-        case "REAL_CLICK": {
-          const tid = sender.tab ? sender.tab.id : quizTabId;
-          const res = await realClick(tid, msg.x, msg.y);
-          try { sendResponse(res); } catch {}
-          break;
-        }
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  restoreRun()
+    .then(() => handleMessage(message, sender))
+    .then((result) => {
+      sendResponse(result);
+      if (result && result.closeGptTab) {
+        setTimeout(() => closeGptTab(), 250);
       }
-    } catch (e) {
-      console.warn("[Auto] bg error:", e);
-    }
-  })();
+    })
+    .catch((error) => {
+      const detail = error instanceof Error ? error.message : String(error);
+      const tabId = (activeRun && activeRun.tabId) || (sender.tab && sender.tab.id);
+      sendStatus("Automation error: " + detail, tabId);
+      sendResponse({ ok: false, error: detail });
+      if (activeRun && sender.tab && sender.tab.id === activeRun.gptTabId) {
+        void failRun("ChatGPT response process nahi hua: " + detail);
+      }
+    });
   return true;
 });
 
-// ============ CHATGPT TAB ============
-async function ensureGptTab() {
-  if (gptTabId != null) {
-    try { await chrome.tabs.get(gptTabId); return gptTabId; }
-    catch { gptTabId = null; }
-  }
-  const tabs = await chrome.tabs.query({ url: "https://chatgpt.com/*" });
-  if (tabs.length) { gptTabId = tabs[0].id; return gptTabId; }
-  status("ChatGPT tab khol raha hun...");
-  const t = await chrome.tabs.create({ url: GPT_URL, active: false });
-  gptTabId = t.id;
-  await sleep(3500);
-  return gptTabId;
-}
+async function handleMessage(message, sender) {
+  switch (message && message.type) {
+    case "BEGIN": {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!tab || tab.id == null) return { ok: false, error: "Quiz tab nahi mila." };
+      if (activeRun) return { ok: false, error: "Ek quiz flow pehle se chal raha hai." };
 
-// ============ DEBUGGER ============
-async function ensureDbg(tabId) {
-  try {
-    await chrome.debugger.sendCommand({ tabId }, "Runtime.evaluate", { expression: "1" });
-    return true;
-  } catch {
-    try {
-      await chrome.debugger.attach({ tabId }, "1.3");
-      return true;
-    } catch (e2) {
-      if (/already attached/i.test(String((e2 && e2.message) || e2))) return true;
-      return false;
-    }
-  }
-}
-
-async function dbgSend(tabId, method, params) {
-  try {
-    return await chrome.debugger.sendCommand({ tabId }, method, params);
-  } catch (e) {
-    const m = String((e && e.message) || e);
-    if (/not attached/i.test(m)) {
-      const ok = await ensureDbg(tabId);
-      if (!ok) throw e;
-      return await chrome.debugger.sendCommand({ tabId }, method, params);
-    }
-    throw e;
-  }
-}
-
-async function realClick(tabId, x, y) {
-  if (!(await ensureDbg(tabId))) {
-    return { ok: false, error: "debugger fail — F12 band karo" };
-  }
-  try {
-    const base = { x, y, button: "left", clickCount: 1, pointerType: "mouse" };
-    await dbgSend(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", ...base });
-    await sleep(30);
-    await dbgSend(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", ...base });
-    await sleep(30);
-    await dbgSend(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", ...base });
-    return { ok: true };
-  } catch (e) {
-    return { ok: false, error: "click fail: " + String((e && e.message) || e) };
-  }
-}
-
-// ============ WATCHDOG ============
-function armWatchdog(sec, text, kind = "quiz") {
-  clearWatchdog();
-  wdKind = kind;
-  watchdog = setTimeout(() => {
-    if (recoverUsed < 2 && kind !== "none") {
-      recoverUsed++;
-      if (wdKind === "gpt" && lastBatch) {
-        status("GPT slow — batch dobara bheja (" + recoverUsed + "/2)...");
-        (async () => {
-          gptTabId = await ensureGptTab();
-          await sendToTabRetry(gptTabId, { type: "ANSWER_ALL", questions: lastBatch }, 6, 800);
-        })();
-        armWatchdog(sec, text, "gpt");
-      } else {
-        status("Atak gaya — recover " + recoverUsed + "/2...");
-        sendToTab(quizTabId, { type: "RECOVER" });
-        armWatchdog(sec, text, "quiz");
+      await closeGptTab();
+      const runId = Date.now() + "-" + Math.random().toString(36).slice(2);
+      activeRun = {
+        runId,
+        tabId: tab.id,
+        frameId: null,
+        state: "scanning",
+        questions: [],
+        answers: null,
+        gptTabId: null
+      };
+      await persistRun();
+      sendStatus("Quiz question wala frame dhoondh raha hun...");
+      try {
+        await chrome.tabs.sendMessage(tab.id, { type: "PROBE", runId });
+      } catch {
+        activeRun = null;
+        return { ok: false, error: "Extension reload karke quiz page refresh karein." };
       }
-    } else {
-      status("⚠ " + text);
+
+      setTimeout(() => {
+        if (activeRun && activeRun.runId === runId && activeRun.frameId === null) {
+          void failRun("Quiz question/frame nahi mila; quiz dialog open karke phir Start karein.");
+        }
+      }, 8000);
+      return { ok: true };
     }
-  }, sec * 1000);
-}
-function clearWatchdog() {
-  if (watchdog) { clearTimeout(watchdog); watchdog = null; }
+
+    case "CLAIM_FRAME":
+      if (!activeRun || activeRun.state !== "scanning" ||
+          !sender.tab || sender.tab.id !== activeRun.tabId ||
+          message.runId !== activeRun.runId) return { ok: false };
+      if (activeRun.frameId !== null && activeRun.frameId !== sender.frameId) {
+        return { ok: false };
+      }
+      activeRun.frameId = sender.frameId ?? 0;
+      await persistRun();
+      sendStatus("Quiz frame mil gaya — sare questions scan ho rahe hain...");
+      return { ok: true };
+
+    case "QUESTIONS_READY":
+      if (!isActiveQuizFrame(sender) || activeRun.state !== "scanning" ||
+          message.runId !== activeRun.runId) {
+        return { ok: false, error: "Quiz scan session expire ho gaya; Start dobara dabayein." };
+      }
+      if (!Array.isArray(message.questions) || !message.questions.length ||
+          message.questions.length > 60) {
+        return { ok: false, error: "Scan se valid question batch nahi mila." };
+      }
+      activeRun.questions = message.questions;
+      activeRun.state = "asking";
+      await persistRun();
+      void askChatGPT(activeRun.runId);
+      return { ok: true };
+
+    case "BATCH_ANSWERS": {
+      if (!activeRun || activeRun.state !== "asking" ||
+          !sender.tab || sender.tab.id !== activeRun.gptTabId ||
+          message.runId !== activeRun.runId) return { ok: false };
+      const checked = validateAnswers(activeRun.questions, message.answers);
+      if (!checked.ok) {
+        await failRun("ChatGPT ne tamam valid answers nahi diye: " + checked.error);
+        return { ok: false, error: checked.error };
+      }
+
+      activeRun.answers = checked.answers;
+      activeRun.state = "applying";
+      await persistRun();
+      sendStatus("✅ ChatGPT ke " + Object.keys(checked.answers).length +
+        " answers mile; quiz tab par laut raha hun...");
+      await chrome.tabs.update(activeRun.tabId, { active: true });
+      const applied = await sendToQuiz({
+        type: "APPLY_BATCH",
+        runId: activeRun.runId,
+        answers: checked.answers
+      });
+      if (!applied || !applied.ok) {
+        const error = applied && applied.error
+          ? applied.error
+          : "Quiz frame ne answers apply command accept nahi kiya.";
+        await failRun(error);
+        return { ok: false, error };
+      }
+      return { ok: true, closeGptTab: true };
+    }
+
+    case "PAUSED":
+      if (isActiveQuizFrame(sender)) {
+        sendStatus("⏸ " + String(message.text || "Quiz flow pause hua."));
+        activeRun = null;
+        await persistRun();
+      }
+      return { ok: true };
+
+    case "FINISHED":
+      if (isActiveQuizFrame(sender)) {
+        sendStatus("🎉 Quiz submit/finish complete.");
+        activeRun = null;
+        await persistRun();
+      }
+      return { ok: true };
+
+    case "GPT_ERROR":
+      if (activeRun && sender.tab && sender.tab.id === activeRun.gptTabId &&
+          message.runId === activeRun.runId) {
+        await failRun(String(message.error || "ChatGPT se valid answer nahi mila."));
+        return { ok: true };
+      }
+      return { ok: false };
+
+    case "STOP":
+      if (activeRun) {
+        await sendToQuiz({ type: "CANCEL" });
+        activeRun = null;
+        await persistRun();
+      }
+      await closeGptTab();
+      sendStatus("Automation stop kar diya.");
+      return { ok: true };
+
+    case "STATUS":
+      if (activeRun && sender.tab && sender.tab.id === activeRun.gptTabId) {
+        sendStatus(String(message.text || ""), activeRun.tabId);
+      } else if (sender.tab && (!activeRun || sender.tab.id === activeRun.tabId)) {
+        sendStatus(String(message.text || ""), sender.tab.id);
+      }
+      return { ok: true };
+
+    default:
+      return { ok: false, error: "Unknown extension command." };
+  }
 }
 
-// ============ HELPERS ============
-function status(text) { sendToTab(quizTabId, { type: "STATUS", text }); }
-function sendToTab(tabId, payload) {
-  if (tabId == null) return Promise.resolve(false);
-  return chrome.tabs.sendMessage(tabId, payload).then(() => true).catch(() => false);
+async function askChatGPT(runId) {
+  try {
+    const tab = await chrome.tabs.create({ url: "https://chatgpt.com/", active: true });
+    if (!activeRun || activeRun.runId !== runId) {
+      if (tab.id != null) await chrome.tabs.remove(tab.id);
+      return;
+    }
+    gptTabId = tab.id;
+    gptTabOwned = true;
+    activeRun.gptTabId = tab.id;
+    await persistRun();
+    sendStatus("💬 ChatGPT khula — ek batch mein " + activeRun.questions.length + " questions bhej raha hun...");
+
+    const pageReady = await waitForChatGptPage(tab.id, 120, 500);
+    if (!pageReady) {
+      await failRun("ChatGPT page load nahi hui. Login/network check karke dobara Start karein.");
+      return;
+    }
+    const sent = await sendMessageWithRetry(tab.id, {
+      type: "ANSWER_BATCH",
+      runId,
+      questions: activeRun.questions
+    }, 40, 500);
+    if (!sent) {
+      await failRun("ChatGPT page ready nahi hui. Login/page load check karke dobara Start karein.");
+      return;
+    }
+    sendStatus("🧠 ChatGPT request start hui; prompt aur send confirmation ka wait...");
+    setTimeout(() => {
+      if (activeRun && activeRun.runId === runId && activeRun.state === "asking") {
+        void failRun("ChatGPT se response ka wait timeout hua; tab mein response check karein.");
+      }
+    }, 300000);
+  } catch (error) {
+    await failRun("ChatGPT tab open nahi hua: " + error.message);
+  }
 }
-async function sendToTabRetry(tabId, payload, tries = 6, delay = 800) {
-  for (let i = 0; i < tries; i++) {
-    if (await sendToTab(tabId, payload)) return true;
-    await sleep(delay);
+
+async function waitForChatGptPage(tabId, attempts, delay) {
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    if (!activeRun || activeRun.gptTabId !== tabId) return false;
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      const url = new URL(tab.url);
+      if (tab.status === "complete" &&
+          (url.hostname === "chatgpt.com" || url.hostname === "chat.openai.com")) {
+        return true;
+      }
+    } catch {}
+    await new Promise((resolve) => setTimeout(resolve, delay));
   }
   return false;
 }
-async function getActiveTab() {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  return tab;
+
+function validateAnswers(questions, rawAnswers) {
+  if (!rawAnswers || typeof rawAnswers !== "object") {
+    return { ok: false, error: "JSON answer object missing." };
+  }
+  const answers = {};
+  for (const question of questions) {
+    const letter = String(rawAnswers[question.n] || "").toUpperCase();
+    const index = letter.charCodeAt(0) - 65;
+    if (letter.length !== 1 || index < 0 || index >= question.options.length) {
+      return { ok: false, error: "Q" + question.n + " ka answer missing/invalid." };
+    }
+    answers[question.n] = letter;
+  }
+  return { ok: true, answers };
+}
+
+async function sendToQuiz(message) {
+  if (!activeRun || activeRun.frameId === null) return null;
+  try {
+    return await chrome.tabs.sendMessage(activeRun.tabId, message, {
+      frameId: activeRun.frameId
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function sendMessageWithRetry(tabId, message, retries, delay) {
+  for (let attempt = 0; attempt < retries; attempt++) {
+    if (!activeRun || activeRun.gptTabId !== tabId) return false;
+    try {
+      const response = await chrome.tabs.sendMessage(tabId, message);
+      if (response && response.ok) return true;
+    } catch {}
+    await new Promise((resolve) => setTimeout(resolve, delay));
+  }
+  return false;
+}
+
+async function failRun(text) {
+  sendStatus("⏸ " + text);
+  if (activeRun) await sendToQuiz({ type: "CANCEL" });
+  activeRun = null;
+  await persistRun();
+}
+
+async function restoreRun() {
+  if (activeRun) return;
+  const stored = await chrome.storage.session.get(RUN_STORAGE_KEY);
+  activeRun = stored[RUN_STORAGE_KEY] || null;
+  if (activeRun && activeRun.gptTabId != null) {
+    gptTabId = activeRun.gptTabId;
+    gptTabOwned = true;
+  }
+}
+
+async function persistRun() {
+  if (activeRun) {
+    await chrome.storage.session.set({ [RUN_STORAGE_KEY]: activeRun });
+  } else {
+    await chrome.storage.session.remove(RUN_STORAGE_KEY);
+  }
+}
+
+async function closeGptTab() {
+  const tabId = gptTabId;
+  const owned = gptTabOwned;
+  gptTabId = null;
+  gptTabOwned = false;
+  if (!owned || tabId == null) return;
+  try { await chrome.tabs.remove(tabId); } catch {}
+}
+
+function isActiveQuizFrame(sender) {
+  return Boolean(
+    activeRun && sender.tab && sender.tab.id === activeRun.tabId &&
+    activeRun.frameId === (sender.frameId ?? 0)
+  );
+}
+
+function sendStatus(text, tabId = activeRun && activeRun.tabId) {
+  if (tabId == null) return;
+  chrome.tabs.sendMessage(tabId, { type: "STATUS", text }).catch(() => {});
 }

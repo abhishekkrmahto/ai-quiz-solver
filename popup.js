@@ -1,11 +1,26 @@
+"use strict";
+
+const status = document.getElementById("status");
+
+function message(payload) {
+  return chrome.runtime.sendMessage(payload);
+}
+
 document.getElementById("start").addEventListener("click", async () => {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  chrome.tabs.sendMessage(tab.id, { type: "PING" }, (r) => {
-    if (chrome.runtime.lastError || !r) {
-      alert("Ye page pe kaam nahi karega — quiz wale tab pe jaake try karo.");
-    } else {
-      chrome.runtime.sendMessage({ type: "START" });
-      window.close();
-    }
-  });
+  status.textContent = "Starting…";
+  try {
+    const result = await message({ type: "BEGIN" });
+    status.textContent = result.ok ? "Quiz scan started." : result.error;
+  } catch (error) {
+    status.textContent = "Start failed: " + error.message;
+  }
+});
+
+document.getElementById("stop").addEventListener("click", async () => {
+  try {
+    await message({ type: "STOP" });
+    status.textContent = "Stopped.";
+  } catch (error) {
+    status.textContent = "Stop failed: " + error.message;
+  }
 });
