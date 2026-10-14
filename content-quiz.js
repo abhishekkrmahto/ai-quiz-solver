@@ -277,14 +277,26 @@ async function goBackToFirst(currentFlow) {
 async function waitForPreviousQuestion(currentFlow, previousQuestion, previousNumber) {
   const previous = normalizeText(previousQuestion);
   const end = Date.now() + 5000;
+  let stableSnapshot = "";
+  let stablePolls = 0;
   while (Date.now() < end) {
     if (isStale(currentFlow)) return false;
     const question = getQuestion();
     const badge = parseBadge();
-    if (question && (
-      normalizeText(question) !== previous ||
-      (previousNumber && badge && badge.cur < previousNumber)
-    )) return true;
+    const changed = question && normalizeText(question) !== previous &&
+      (!previousNumber || !badge || badge.cur < previousNumber);
+    if (changed && getOptionCards().length >= 2) {
+      const snapshot = questionSnapshot(question);
+      if (snapshot === stableSnapshot) stablePolls++;
+      else {
+        stableSnapshot = snapshot;
+        stablePolls = 0;
+      }
+      if (stablePolls >= 2) return true;
+    } else {
+      stableSnapshot = "";
+      stablePolls = 0;
+    }
     await sleep(200);
   }
   return false;
@@ -304,6 +316,8 @@ async function waitForQuestion(currentFlow, maxMs) {
 async function waitForQuestionChange(currentFlow, previousQuestion, previousNumber) {
   const previous = normalizeText(previousQuestion);
   const end = Date.now() + 5000;
+  let stableSnapshot = "";
+  let stablePolls = 0;
   while (Date.now() < end) {
     if (isStale(currentFlow)) return false;
     const question = getQuestion();
@@ -312,11 +326,28 @@ async function waitForQuestionChange(currentFlow, previousQuestion, previousNumb
       continue;
     }
     const badge = parseBadge();
-    if (normalizeText(question) !== previous ||
-        (previousNumber && badge && badge.cur > previousNumber)) return true;
+    const changed = normalizeText(question) !== previous &&
+      (!previousNumber || !badge || badge.cur > previousNumber);
+    if (changed && getOptionCards().length >= 2) {
+      const snapshot = questionSnapshot(question);
+      if (snapshot === stableSnapshot) stablePolls++;
+      else {
+        stableSnapshot = snapshot;
+        stablePolls = 0;
+      }
+      if (stablePolls >= 2) return true;
+    } else {
+      stableSnapshot = "";
+      stablePolls = 0;
+    }
     await sleep(200);
   }
   return false;
+}
+
+function questionSnapshot(question) {
+  return normalizeText(question) + "\n" +
+    getOptionCards().map((card) => normalizeText(optionText(card))).join("\n");
 }
 
 async function waitForFinish(currentFlow, previousQuestion) {

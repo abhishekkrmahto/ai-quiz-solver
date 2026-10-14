@@ -14,6 +14,8 @@ test("batch prompt contains all questions and numbered choices in one prompt", (
   assert.match(prompt, /Question 1: Which one\?/);
   assert.match(prompt, /Question 2: Pick a letter/);
   assert.match(prompt, /C\) Third/);
+  assert.match(prompt, /evaluate each option against the exact wording/);
+  assert.match(prompt, /independently re-check every selected letter/);
   assert.match(prompt, /valid JSON/);
 });
 
